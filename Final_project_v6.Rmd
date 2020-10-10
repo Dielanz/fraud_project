@@ -1,0 +1,907 @@
+---
+title: "Final Project"
+author: "Ruslan Askerov, Dylan Weber, Eric Kwon, Le Michael Song"
+date: "12/11/2019"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cerulean
+    
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(error=TRUE,        # Keep compiling upon error
+                      cache=FALSE,       # don't cache anythin by default
+                      collapse=FALSE,    # collapse by default
+                      echo=TRUE,         # echo code by default
+                      comment = "#>",    # change comment character
+                      fig.width = 6,     # set figure width
+                      out.width = "50%", # set width of displayed images
+                      warning=FALSE,     # do not show R warnings
+                      message=FALSE)     # do not show R messages
+```
+
+## Credit card fraud prediction
+
+### Description and business background
+
+In 2018, cost of credit card fraud reached $24.3bn and grew 18.4% from 2017 levels1. Given increasing amounts of customer information online, fraudsters now have more data points to work with in order to build a complete customer profile. With the recent breach at CapitalOne Financial, more people are likely to become victims of credit card fraud. 
+
+Based on the “State of Card Fraud: 2018” report from the American Banking Association, key initiatives related to credit card fraud include faster fraud detection, faster customer communication, card reissuance, fraud reduction and better fraud detection alerts. 2 Of these initiatives, 55% picked faster fraud detection as their top goal. Using the Kaggle data given, we hope to improve both the speed and accuracy of fraud detection.  
+
+### Data description and goal 
+
+It is important to note that the data set is highly unbalanced, meaning that there is only 492 observations that are labeled as fraud out of 285k, which is roughly 0.172%. 
+
+Our goal is to accurately identify fraudulent transactions while minimizing Type I and Type II error rates. 
+
+![Trade-off between FN and FP](C:/Users/asker/Box/MBA/Darden/Courses/DATA MINING/Final Project/creditcardfraud/table.jpg)
+As part of the prediction exercise, we as the issuer need to consider the trade-off between lower false negative and false positive rates. While there is direct/immediate financial cost associated with false negative transactions (we need to cover the fraudulent transaction amount), some of the longer term costs may outweigh this.  
+
+If we block a valid transaction, the customer will get extremely angry / embarrassed, not to mention inconvenience if this is their only method of payment (and in a foreign country). In both cases, the customer may choose to leave and use other credit cards instead. To fully understand the non-immediate trade-offs, we’ll need to acquire data on customer lifetime value as well as likelihood of customer retention in various scenarios. In terms of the immediate financial costs to the issuer, in the case of false positive, we’ll lose the transaction. If the transaction is on average \$88 and the credit card fee is \$2.20, the issuer will on average receive \$1.54 (with the rest going to merchant acquirer and card network). In the case of false negative, the issuer is required to cover the fraudulent transaction (\$122).  
+
+Based on Lecture 9 on classification, let FP be the cost of false positive and FN be the cost of false negative. Given the lack of information noted above, we decided to set FN = FP. We will issue a positive indication for fraud if:  
+
+$P(x) > \frac{FP}{(FP + FN)}$  
+
+$P(x) > 0.5$ 
+
+### Importing necessary libraries
+```{r loading libraries}
+library(tidyverse)
+library(rpart)
+library(ranger)
+library(rpart.plot)
+library(bannerCommenter)
+library(ipred)
+library(glmnet)
+library(PRROC)
+library(caret)
+library(xgboost)
+library(randomForest)
+library(knitr)
+library(kableExtra)
+library(shiny)
+library(data.table)
+library(ggplot2)
+```
+
+### EDA
+
+To explore the data closer let's take a look at transaction statistics
+
+```{r}
+
+cc_zero <- credit_card %>% filter(Class == '0')
+cc_one <- credit_card %>% filter(Class == '1')
+
+summary(cc_zero$Amount)
+summary(cc_one$Amount)
+
+```
+The mean of non-fraudulent transactions is about $88, with a median of \$22. The mean is mostly dragged up by extreme transactions. 
+On the contrary, the mean of the fraudulent transactions is higher at \$122. However, the median is significantly lower at \$9. For the purposes of this paper we'll be using means for the cost calculations. However, that should be decided by the business executives, whether or not this a reasonable metric. 
+
+### Data Vizualization using Shiny
+
+As we'll see below, we decided to balance the dataset by undersampling the majority class (non-Fraud).
+
+After balancing the dataset, we created a shiny app to share between us so that we could easily visualize differences in the distributions of the different predictor variables (all of which were anonymized and scaled before being posted to Kaggle).
+
+The app itself consists of three pages, one each for boxplot, density, and scatterplots. You can choose one variable to visualize at a time for boxplot and density, each of which separates the visualization by the response (Class) variable. For the scatterplot, you can choose two variables to visualize, and the points are colored according to the response variable. 
+
+For all of the charts, you can choose to either use the balanced dataset or the unbalanced dataset, and this allowed us to see whether there were large changes in the distributions of the x-variables after undersampling the majority class. 
+
+The app could also help us visualize the separation between the positive and negative class for our response variable, according to each predictor variable, with increasing levels of complexity. The boxplot is the simplest, and we could expect that where the x distribution for the fraud class looks very different for the x distribution for the non-fraud class, this x-variable should be a strong predictor, unless it's strongly correlated with something more powerful. The density is similar to the boxplot except we get a better sense of the overlap between the two classes and can better understand the dispersion of our data. Finally, the scatterplot does the same as the prior two, except we can visualize two predictors at once, theoretically enabling us to visualize more complex interactions in our data.
+
+If there are any issues with the following embedded app, we also posted it online here (using the same code):
+
+https://dylanweber.shinyapps.io/creditcardfraud/
+
+The caveat to the online app is the scatterplot with the unbalanced data does not work. This is likely due to the size of the unbalanced dataset not working within the free-tier. 
+
+```{r, echo=FALSE, eval = FALSE}
+
+#Based on Practice & Application example which was then based on:
+
+#Framework Source: https://bookdown.org/paulcbauer/idv2/8-20-example-a-simple-regression-app.html
+
+#For debugging used:
+
+#https://stackoverflow.com/questions/32969659/shiny-reactive-ggplot-output
+#https://stackoverflow.com/questions/41024068/shiny-plots-dont-render-no-error-code/41106626
+
+balanced <- fread('balanced_data.csv')
+balanced$Class <- as.factor(balanced$Class)
+
+unbalanced <- fread('creditcard.csv')
+unbalanced$Class <- as.factor(unbalanced$Class)
+
+#to be used in dropdowns
+variable_choices = list('V1'='V1', 'V2'='V2','V3'='V3','V4'='V4','V5'='V5','V6'='V6','V7'='V7','V8'='V8','V9'='V9','V10'='V10',
+                  'V11'='V11', 'V12'='V12','V13'='V13','V14'='V14','V15'='V15','V16'='V16','V17'='V17','V18'='V18','V19'='V19','V20'='V20',
+                  'V21'='V21', 'V22'='V22','V23'='V23','V24'='V24','V25'='V25','V26'='V26','V27'='V27','V28'='V28','Amount'='Amount')
+
+#to be used in dropdowns
+dataset_choices = list('Unbalanced'='unbalanced','Balanced'='balanced')
+     
+#Define UI layout             
+ui <- fluidPage(
+  titlePanel("Boxplot, Density, Scatter"),
+  sidebarLayout(
+    sidebarPanel(
+      selectInput("variable_1", label = h3("Variable 1"),
+                  choices = variable_choices, selected = 1),
+      
+      selectInput("variable_2", label = h3("Variable 2 (Scatter Only)"),
+                  choices = variable_choices, selected = 1),
+      
+      selectInput("dataset", label = h3("Dataset"),
+                  choices = dataset_choices, selected = 1)
+),
+    #Create tabs for the different plots
+    mainPanel(
+      tabsetPanel(type = "tabs",
+                  
+                  tabPanel("Boxplot", plotOutput("boxplot")), 
+                 
+                  tabPanel("Density", plotOutput("density")), 
+                  
+                  tabPanel("Scatter", plotOutput("scatter")) 
+  
+      )
+    )  
+))
+
+# SERVER
+server <- function(input, output) {
+  data <- reactive({
+    if(input$dataset=='balanced'){
+      return(balanced)
+    }
+    return(unbalanced)
+  })
+  
+  
+  # boxplot output
+  output$boxplot <- renderPlot({
+
+      ggplot(data=data(), aes_string(x='Class', y=input$variable_1, fill='Class')) + 
+      geom_boxplot() +
+      labs(title='Boxplot with Class Indicated by Color', fill = 'Fraud')
+
+    }, height=600)
+  
+  
+  
+  # density output
+ output$density <- renderPlot({
+   
+   ggplot(data=data(), aes_string(x=input$variable_1, fill='Class')) +
+     geom_density(alpha=0.4) +
+     labs(title='Density with Class Indicated by Color', fill = 'Fraud',y='Density')
+   
+  }, height=600)
+
+ 
+ # scatter output
+ output$scatter <- renderPlot({
+   
+   ggplot(data=data(),aes_string(x=input$variable_1,y=input$variable_2,color='Class')) +
+     geom_point() +
+     geom_density_2d() +
+     labs(title='Scatterplot with Class Indicated by Color', color = 'Fraud')
+   
+ }, height=600)
+ 
+}
+
+shinyApp(ui = ui, server = server)
+
+```
+
+## Methodology
+
+In this paper we will be applying several predictive classification Machine Learning techniques to reach the goal of minimizing the cost function. We will compare individual model accuracies and at the end we will use several ensemble techniques to see if the ensembled model will yield better predictions. 
+
+Since the dataset is highly unbalanced, it's meaningless to use ROC or overall accuracy for model comparison. We will be using the **Area Under The Precision Recall Curve (AUPRC)** metric. 
+
+### Used models 
+  - Logistic regression
+  - Penalized logistic regression (Elastic net)
+  - Decision Tree
+  - Random Forest
+  - XGBoost
+  - Average, Median and Stacking Ensembles
+
+
+
+## Loading the data
+
+### Importing the data and splitting into train and test sets
+
+Let's take a look at the structure of the data first.
+```{r }
+credit_card <- read_csv('creditcard.csv')
+
+glimpse(credit_card)
+```
+As we can see there is ~285k observations and 31 variables including the target variable **"Class"**
+
+### Train / Test split
+
+Next step we need to split the data into train and test sets and remove variable "Time", since time series analysis is out of scope of this paper. 
+```{r}
+## 75% of the sample size
+smp_size <- floor(0.75 * nrow(credit_card))
+
+## set the seed to make your partition reproducible
+set.seed(123)
+train_ind <- sample(seq_len(nrow(credit_card)), size = smp_size)
+
+train <- credit_card[train_ind, ]
+test <- credit_card[-train_ind, ]
+
+train <- train %>% select(-Time)
+test <- test %>% select(-Time)
+
+train$Class <- as.factor(train$Class)
+test$Class <- as.factor(test$Class)
+
+```
+
+### Trial model on unbalanced dataset
+
+To start with we will use logistic regression technique, which is relatively easy to fit and does not require any parameter tuning. We will also set seed at this point for reproducibility purposes.
+
+```{r}
+set.seed(13)
+train_log <- train
+train_log <- ifelse(train$Class == "1", 1, 0)
+
+logit_unb_model <- glm(Class~., data = train, family = "binomial")
+
+logit_pred<-predict(logit_unb_model,newdata=test, type = "response")
+
+logit_predictions<-ifelse(logit_pred>0.5,1,0)
+
+logit_cm <- confusionMatrix(as.factor(logit_predictions), as.factor(test$Class))
+logit_cm
+
+```
+As we discussed before, Accuracy is 99.9% which is meaningless in this case, since the data was very unbalanced and most of the observations are **not fraud**. If we take a look at the confusion matrix results, we can see that the model did pretty well overall, but didn't do so well on the actual fraud predictions. For our case, we are defining specificty as a measure of how many frauds were correctly classified as frauds. It is only 54%, which is barely above the random guess of 50%. 
+Next step would be to balance the dataset and see if training the models on the balanced dataset will improve the specificity metric. 
+
+
+## Modeling
+
+### Balancing the dataset
+
+We will use undersampling balancing technique, which is basically shrinking the dataset to make 50% of its observations labeled as fraud and 50% as not fraud. We undersample from the train dataset and leaving the test dataset intact so that there would be no overfitting. 
+
+```{r}
+
+class_yes <- train %>% filter(Class == 1)
+class_no <- train %>% filter(Class == 0)
+
+set.seed(13)
+class_no_samp <- sample_n(class_no, nrow(class_yes))
+
+balanced <- rbind(class_yes, class_no_samp)
+
+
+test_yn <- test
+test_yn$Class <- ifelse(test_yn$Class == "1", "Yes", "No")
+
+balanced_yn <- balanced
+balanced_yn$Class <- ifelse(balanced_yn$Class == "1", "Yes", "No")
+
+```
+
+### Fitting logistic regression
+
+```{r}
+balanced_log <- balanced
+
+balanced_log$Class <- ifelse(balanced_log$Class == "Yes", 1, 0)
+
+logit <- glm(Class~., data = balanced, family = "binomial")
+
+logit_pred<-predict(logit,newdata=test, type = "response")
+
+logit_predictions<-ifelse(logit_pred>0.5,1,0)
+
+logit_cm <- confusionMatrix(as.factor(logit_predictions), as.factor(test$Class))
+
+print(logit_cm)
+
+
+```
+
+This model didn't converge, but we still see that specificity jumped to 87% and we correctly classified 117 out of 134 fraudulent transactions. However, we got to the new problem of high number of false positives. Let's see if we can get that number down with more sophisticated modeling approaches. 
+
+### Fitting penalized logistic regression model (Pure Lasso)
+
+Our next model is going to be penalized(or shrinked) lasso regression. There are a couple of things worth mentioning. First of all, we will be using 10-fold cross-validation and also we need to transform our predictor and response varialble space into matrices. 
+
+```{r creating matrices}
+X.train = balanced %>% select(-Class) %>% as.matrix()
+Y.train = balanced %>% select(Class) %>% as.matrix()
+
+X.test = test %>% select(-Class) %>% as.matrix()
+Y.test = test %>% select(Class) %>% as.matrix()
+
+
+set.seed(13)                      
+n.folds = 10                       
+fold = sample(rep(1:n.folds, length=nrow(X.train)))  
+```
+
+```{r fitting the model}
+#-- Lasso
+fit.lasso = cv.glmnet(X.train, Y.train, alpha=1, foldid=fold, family = 'binomial')
+beta.lasso = coef(fit.lasso, s="lambda.min")
+yhat.lasso = predict(fit.lasso, newx = X.test, s="lambda.min", type = 'response')
+
+lasso_pred <- ifelse(yhat.lasso > 0.5, "1", "0")
+
+cm_lasso <- confusionMatrix(as.factor(lasso_pred), as.factor(test$Class))  
+cm_lasso
+
+```
+
+Now let's take a look at the metric AUPRC and the graph. 
+
+```{r}
+ones <- yhat.lasso[test$Class == 1]
+zeroes <- yhat.lasso[test$Class == 0]
+
+# AUPRC and PR Curve
+pr <- pr.curve(scores.class0 = ones, scores.class1 = zeroes, curve = T)
+plot(pr)
+
+```
+
+AUCPR roughly 54% and as we can see, compared to our logistic regression model, lasso did a little better on specificity. 
+Also what's interesting about this graph is that you can choose the best cutoff value for determining the fraud according to the probability. It turns out that for pure lasso model the optimal cutoff would be at around 0.75, right in the middle of the graph. So let's try to use this new cut-off and see if we get better results. 
+
+```{r}
+lasso_pred_new <- ifelse(yhat.lasso > 0.75, "1", "0")
+
+cm_lasso_new <- confusionMatrix(as.factor(lasso_pred_new), as.factor(test$Class))  
+cm_lasso_new
+
+```
+As we can see from the output above, our true predictions stayed almost the same, but by changing the cut-off we managed to reduce false positives by about a half. 
+
+
+### Fitting Elastic Net logistic regression model
+
+Our next model in the list is elastic net logistic regression. We are using the same 10-fold Cross-validation and tuning both hyperparameters $\alpha$ and $\lambda$.
+```{r}
+set.seed(13)
+myControl <- trainControl(
+  method = "cv", 
+  number = 10,
+  verboseIter = TRUE,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+
+remove_output <- capture.output(model <- train(
+  Class ~ ., 
+  balanced_yn,
+  tuneGrid = expand.grid(
+    alpha = seq(0.0001, 1, length = 20),
+    lambda = seq(0.0001, 1, length = 20)),
+  method = "glmnet",
+  metric = 'Spec',
+  trControl = myControl
+))
+
+elastic_pred <- predict(model, newdata = test_yn, type = 'prob')
+
+predictions <- ifelse(elastic_pred$Yes > 0.5, "Yes", "No")
+
+cm_elasticnet <- confusionMatrix(as.factor(predictions), as.factor(test_yn$Class))  
+cm_elasticnet
+```
+
+```{r}
+
+ones <- elastic_pred$Yes[test$Class == 1]
+zeroes <- elastic_pred$Yes[test$Class == 0]
+
+# AUPRC and PR Curve
+pr <- pr.curve(scores.class0 = ones, scores.class1 = zeroes, curve = T)
+plot(pr)
+
+```
+This model is a significant improvement in terms of AUCPR, by almost 4%. Also, here we see the cut-off value clearly at about 0.9. So let's apply that and see what our accuracy would be. 
+
+```{r}
+elastic_pred_new <- ifelse(elastic_pred$Yes > 0.89, "Yes", "No")
+
+cm_elasticnet <- confusionMatrix(as.factor(elastic_pred_new), as.factor(test_yn$Class))  
+cm_elasticnet
+```
+
+Taking a look at the output, we can see that using the cut-off of 0.89 we can reach improved accuracy for our model. 
+
+### Fitting a decision tree
+
+```{r}
+set.seed(1)
+
+# Build a complex Classification Tree model without adjusted parameters on balanced training set
+cl_tree_model <- rpart(Class~., data = balanced, method = "class", control = rpart.control(cp = 0))
+
+# Predict
+cl_tree_pred <- predict(cl_tree_model, test, type = "class")
+cl_tree_pred_prob <- predict(cl_tree_model, test, type = "prob")[,2]
+
+```
+
+
+```{r}
+tree_pred <- ifelse(cl_tree_pred_prob > 0.90, 1, 0)
+
+# Create confusion matrix
+cm_tree <- confusionMatrix(data = as.factor(tree_pred), reference = as.factor(test$Class))
+print(cm_tree)
+
+```
+
+### Pruning a decision tree
+
+```{r}
+
+set.seed(13)
+
+# Build a pruned tree using cp = 0.11
+cl_tree_model_pruned <- prune(cl_tree_model, cp = 0.11)
+
+# Predict
+cl_tree_pred_pruned <- predict(cl_tree_model_pruned, test, type = "class")
+cl_tree_pred_pruned_prob <- predict(cl_tree_model_pruned, test, type = "prob")[,2]
+
+# Create confusion matrix
+cm_pruned <- confusionMatrix(data = cl_tree_pred_pruned, reference = as.factor(test$Class))
+cm_pruned
+
+```
+
+This is not the best model we've had so far. Also, it has the same problem which we had for our initial logistic regression. It just has two probabilities in it. So plotting it doesn't really make sense. 
+
+### Fitting Random Forest
+
+Random forest method forms multiple decision trees subsets, each of which consists of a subset of features, and the average of results from these trees are used to predict classes. In this way, the final outcome is less vulnerable to any potential noise that might exist in the training set and able to avoid overfitting more proficiently than a single tree can. 
+
+Prior to fitting a random forest model, we wanted to identify the optimal number for mtry which indicates the number of features available for sampling at each split by running a tuneRF function.  The output of this model shows which mtry reduces the out-of-bag error, a measure of prediction error for random forests. 
+
+After determining which mtry would be optimal for our random forest model, we ran the ranger function from the caret package which allows an easy implementation of cross-validation for ensuring that all samples appear for training purposes. 
+
+
+
+```{r}
+set.seed(1)   
+
+#balanced$Class <- ifelse(balanced$Class == "1", "Yes", "No")
+
+# Find out which mtry minimizes OOB error
+res <- tuneRF(x = subset(balanced_yn, select = -Class),
+              y = as.factor(balanced_yn$Class),
+              ntreeTry = 500)
+
+# Print output
+print(res) # mtry of 3 minimizes error
+
+# Set parameters to try Random Forest on 
+tuneGrid <- data.frame(
+  .mtry = 3,
+  .splitrule = "gini",
+  .min.node.size = c(4,5,6,7)
+)
+
+set.seed(1)   
+
+# Try multiple versions of Random Forest: mtry = 3, splitrule = gini, min.node.size = 4
+cap_out <- capture.output(rf_cv <- train(
+  Class~.,
+  tuneGrid = tuneGrid,
+  data = balanced_yn, 
+  method = "ranger",
+  trControl = trainControl(
+    method = "cv", 
+    number = 5, 
+    verboseIter = TRUE
+  )
+))
+
+# Build model with probability setting on instead of class output
+balanced_for_rf<-balanced_yn
+
+set.seed(1)
+
+cap_out2 <- capture.output(rf_cv_prob <- train(
+  Class~.,
+  tuneGrid = tuneGrid,
+  data = balanced_for_rf, 
+  method = "ranger",
+  trControl = trainControl(
+    method = "cv", 
+    number = 5, 
+    verboseIter = TRUE,
+    classProbs = TRUE
+  )
+))
+
+
+rf_cv_pred <- predict(rf_cv,test)
+rf_cv_pred_prob <- predict(rf_cv_prob,test, type = "prob")$Yes
+
+
+# Create confusion matrix
+rf_cv_cm <- confusionMatrix(rf_cv_pred, as.factor(test_yn$Class))
+rf_cv_cm
+
+```
+
+```{r}
+
+ones <- rf_cv_pred_prob[test$Class == 1]
+zeroes <- rf_cv_pred_prob[test$Class == 0]
+
+# AUPRC and PR Curve
+pr <- pr.curve(scores.class0 = ones, scores.class1 = zeroes, curve = T)
+plot(pr)
+
+```
+
+This model yields the best AUCPR so far. Let's use the suggested cut-off and see the updated accuracy. 
+
+```{r}
+rf_pred_new <- ifelse(rf_cv_pred_prob > 0.8, "Yes", "No")
+
+cm_rf <- confusionMatrix(as.factor(rf_pred_new), as.factor(test_yn$Class))  
+cm_rf
+```
+
+This model is pretty interesting. Usingg the cut-off of 0.8, we lose in true fraud accuracy, but we actually manage to cut the false positive rate by a looming 600 observations. If we try to mimic the previous model's numbers in accuracy, random forest still does better. 
+
+
+### Fitting XGBoost
+
+XG Boost is based on gradient boosted decision trees which goes through a sequence of new trees being fit on an altered data set derived from its original version until improvements can no longer be achieved. For our problem, we fit a basic XG boost model with cross-validation and looked at its evaluation log to identify what the number of trees should be in order to minimize the error.
+
+
+```{r}
+set.seed(1)
+
+# Try a basic xg boost model
+xg <- xgb.cv(data = as.matrix(balanced[,-30]), 
+             label = as.numeric(balanced$Class)-1,
+             nrounds = 100,
+             nfold = 5,
+             objective = "binary:logistic",
+             eta = 0.3,
+             max_depth = 6,
+             early_stopping_rounds = 10,
+             verbose = 0)
+
+# Find the number of trees that minimizes error
+elog <- xg$evaluation_log
+elog %>% 
+  summarize(ntrees.train = which.min(train_error_mean), ntrees.test  = which.min(test_error_mean))
+ 
+# ntrees.train ntrees.test
+# 19          22
+
+# Build a xgboost model using nrounds of 19
+xg <- xgboost(data = as.matrix(balanced[,-30]), 
+             label = as.numeric(balanced$Class)-1,
+             nrounds = 22,
+             objective = "binary:logistic",
+             eta = 0.3,
+             depth = 6,
+             verbose = 0    # silent
+)
+
+# Predict
+xgb_pred_prob <- predict(xg, as.matrix(test[,-30]))
+
+# Convert output to factor
+xgb_pred <- as.factor(ifelse(xgb_pred_prob>0.5,1,0))
+
+# Create confusion matrix
+xgb_cm <- confusionMatrix(data = xgb_pred, reference = as.factor(test$Class))
+
+print(xgb_cm)
+```
+
+```{r}
+
+ones <- xgb_pred_prob[test$Class == 1]
+zeroes <- xgb_pred_prob[test$Class == 0]
+
+# AUPRC and PR Curve
+pr <- pr.curve(scores.class0 = ones, scores.class1 = zeroes, curve = T)
+plot(pr)
+
+```
+Model performance for XG Boost for this particular case is actually worse than the Random Forest one. 
+
+## Ensemble
+
+So if we are thinking in terms of individual model performance, it turns out that Random Forest is the best performing model here. However, we might want to try a simple average and median ensemble to see if the wisdom of the crowds would actually yield better results. 
+
+Let's start with creating a dataframe of predictions of four of our best models : Lasso, Elastic Net, RF and XG Boost
+```{r}
+
+probs_df <- as.data.frame(cbind(yhat.lasso ,elastic_pred$Yes, rf_cv_pred_prob, xgb_pred_prob))
+
+names(probs_df) <- c('lasso', 'e_net', 'rf', 'xgboost')
+
+probs_df <- probs_df %>% 
+  rowwise() %>% 
+  mutate(avg_model = mean(c(lasso, e_net, rf, xgboost)),
+         median_model = median(c(lasso, e_net, rf, xgboost)))
+
+```
+And finally let's check the performance of these simple ensembles. 
+
+```{r}
+probs_mean <- probs_df$avg_model
+probs_median <- probs_df$median_model
+
+ones <- probs_mean[test$Class == 1]
+zeroes <- probs_mean[test$Class == 0]
+
+# AUPRC and PR Curve
+pr <- pr.curve(scores.class0 = ones, scores.class1 = zeroes, curve = T)
+plot(pr)
+
+ones <- probs_median[test$Class == 1]
+zeroes <- probs_median[test$Class == 0]
+
+# AUPRC and PR Curve
+pr <- pr.curve(scores.class0 = ones, scores.class1 = zeroes, curve = T)
+plot(pr)
+
+```
+And confusion matrices:
+
+```{r}
+
+avg_ens_pred <- ifelse(probs_mean > 0.9, "Yes", "No")
+
+cm_avg <- confusionMatrix(as.factor(avg_ens_pred), as.factor(test_yn$Class))  
+cm_avg
+
+med_ens_pred <- ifelse(probs_median > 0.7, "Yes", "No")
+
+cm_med <- confusionMatrix(as.factor(med_ens_pred), as.factor(test_yn$Class))  
+cm_med
+
+```
+
+Overall , as we can see from the outputs above, ensembles or "the wisdom of the crowd" hasn't eventually beaten the Random Forest. 
+
+### Evaluating model performance using cost approximations
+
+Similar to the above approach and mentioned at the beginning, we can also consider evaluating the models and choosing a threshold for class prediction by approximating a cost for a false positive and false negative. However, this presents the challenge of creating reasonable approximations for the costs of each of these. Although the false negative cost being the transaction amount seems reasonable, one online source (https://www.paymentssource.com/opinion/false-positives-and-other-costs-hurt-the-fraud-fight) suggested this cost may be up to 2.5x this amount. 
+
+Either way, the false positive cost is much harder to discern. One approach that yielded a satisfying conclusion was to do a scenario analysis and consider the false positive cost fixed at the transaction amount, and vary the false negative cost to see the impact on what our decision would be in terms of which model to use and what threshold is appropriate. 
+
+```{r}
+
+options(scipen = 999)
+
+rf_xgb <- fread('probs_eric.csv')
+rf_xgb <- rf_xgb[,.(rf_cv_pred_prob,xgb_pred_prob)]
+
+#get lasso and elastic net predictions
+lasso_elasticnet <- setnames(fread('lasso_elasticnet_pred.csv'),c('lasso','elastic_net'))
+
+#get logistic model trained on unbalanced dataset
+logistic <- setnames(fread('logit_pred.csv'),c('delete_me','logistic'))
+logistic <- logistic[,.(logistic)]
+                     
+#get test data response classes and amounts
+response <- fread('testdata.csv')
+response <- response[,.(Amount,Class)]
+
+#combine test response with predicted probabilities from the different models
+combine_preds <- cbind(rf_xgb,lasso_elasticnet,logistic,response)
+
+#we will ensemble these
+pred_cols <- c('rf_cv_pred_prob','xgb_pred_prob','lasso','elastic_net','logistic')
+
+#calculated ensemble of average predicted probability
+combine_preds[,avg_prob := rowMeans(.SD),.SDcols=pred_cols,by=1:nrow(combine_preds)]
+
+#calculated ensemble of max predicted probability
+combine_preds[,max_prob := max(.SD),.SDcols=pred_cols,by=1:nrow(combine_preds)]
+
+#calculated ensemble of min predicted probability
+combine_preds[,min_prob := min(.SD),.SDcols=pred_cols,by=1:nrow(combine_preds)]
+
+```
+
+### Creating our cost function
+
+First, we define function to sum the cost according to our chosen cost approximation for all possible probability thresholds from 0.01 to 0.99. This will help us not only to choose the model which minimizes the total cost of FP + FN, but will also help us visualize the optimal threshold to choose for our model. 
+
+```{r}
+
+#consider all probabiliity thresholds from 0.01 to 0.99
+threshold <- seq(.01,.99,.01)
+
+calculate_cost <- function(dt,threshold,prob_col){
+  
+  # do not modify the original dt
+  dt <- copy(dt)
+  
+  #initialize all predictions to 0
+  dt[,pred:=0]
+  
+  #if predicted probability > threshold, set pred = 1
+  dt[get(prob_col)>=threshold,pred:=1]
+  
+  #initialize all cost to 0
+  dt[,cost:=0]
+  
+  #set cost equal to fp_loss or fn_loss if FP/FN, respectively
+  dt[pred==1&Class==0,cost:=fp_loss]
+  dt[pred==0&Class==1,cost:=fn_loss]
+  
+  return(sum(dt$cost))
+  
+}
+
+```
+
+### Scenario 1: FP = FN = Amount
+
+In our first scenario, we assume the cost of a false positive is the same as the cost of a false negative, both of which are equal to the transaction amount in question. This seems like a reasonable ceiling for the cost of a false positive, as it should not reasonably be expected to be more than the cost of a false negative. 
+
+```{r}
+
+#not fraud, we say it was (assumed to less expensive than FN, this is a ceiling)
+combine_preds[,fp_loss := Amount] # in future scenarios, we divide by stuff here
+
+#was fraud, we say it wasn't (more expensive)
+combine_preds[,fn_loss := Amount ]
+
+#initialize a dt to save results of the loop
+model_comparison <- data.table()
+
+#for probability threshold from 0.01 to 0.99
+for (prob in threshold){
+  
+  #for each model in question
+  for(model in c('rf_cv_pred_prob','xgb_pred_prob','lasso','elastic_net','logistic','avg_prob','max_prob','min_prob')){
+    
+    #calculate cost for this threshold for this model
+    cost <- calculate_cost(combine_preds,prob,model)
+    
+    #add it to our dt
+    model_comparison <- rbind.data.frame(model_comparison,data.table(prob,model,cost))
+    
+  }
+  
+}
+
+#create our chart
+ggplot(model_comparison,aes(x=prob,y=cost,color=model))+
+  geom_line() +
+  labs(title='Total Cost by Probability Threshold',subtitle='Scenario 1: FP = Amount, FN = Amount', color = 'Model',y='Total Cost (FP + FN)',x='Probability Threshold (min cost at 0.89)')
+
+```
+
+What does the chart above tell us? First, let's look at where we minimize our cost using the above assumptions:
+
+```{r}
+model_comparison[cost>=min(model_comparison$cost)&cost<min(model_comparison$cost)+1000]
+```
+
+So the top models with the lowest cost are all random forest models, but it does not become the lowest cost model until the higher end of the probability thresholds. Earlier on, it is quite costly due to the higher probability of false positives - the cost of which in this chart is likely artificially high. One thing we'll see as we lower the cost of the false positive is that the cost function is no longer quite so monotonic throughout all thresholds. It is also worth noting that although the logistic regression does quite well overall, it is not the best model. One of the unintended benefits we found in undersampling the minority class is that we were even able to train the random forest at all. While I wonder whether we might have gotten even better results using random forest on the full datasets, our computers were not actually able to handle doing that, and if nothing else, undersampling helped make our dataset easier to work with. 
+
+### Scenario 2: FP = Amount / 20; FN = Amount
+
+In our this scenario, we assume the false negative cost is still the transaction amount, but now we assume that the false positive cost is the transaction amount divided by 20. We did this because we believe that the false positive cost is likely quite low these days as it's gotten relatively easy for customers to identify these false positives via banking apps and other automated systems (at least in some cases). This way, we can go to an extreme and see how or whether it would change our decision.
+
+
+```{r}
+
+#not fraud, we say it was (assumed to less expensive than FN, this is a ceiling)
+combine_preds[,fp_loss := Amount / 20] # we divide by stuff here
+
+#initialize a dt to save results of the loop
+model_comparison <- data.table()
+
+#for probability threshold from 0.01 to 0.99
+for (prob in threshold){
+  
+  #for each model in question
+  for(model in c('rf_cv_pred_prob','xgb_pred_prob','lasso','elastic_net','logistic','avg_prob','max_prob','min_prob')){
+    
+    #calculate cost for this threshold for this model
+    cost <- calculate_cost(combine_preds,prob,model)
+    
+    #add it to our dt
+    model_comparison <- rbind.data.frame(model_comparison,data.table(prob,model,cost))
+    
+  }
+  
+}
+
+#create our chart
+ggplot(model_comparison,aes(x=prob,y=cost,color=model))+
+  geom_line() +
+  labs(title='Total Cost by Probability Threshold',subtitle='Scenario 2: FP = Amount / 20, FN = Amount', color = 'Model',y='Total Cost (FP + FN)',x='Probability Threshold (min cost at 0.89)')
+
+```
+
+
+```{r}
+model_comparison[cost>=min(model_comparison$cost)&cost<min(model_comparison$cost)+1000][order(cost)]
+```
+
+As we can see, our decision in this scenario wouldn't change (0.89 threshold with random forest model), even though the overall cost has gone down about 10% (down to 4968.73 from 5318.65 in scenario 1)
+
+### Scenario 3: FP = Amount / 50; FN = Amount
+
+In our this scenario, we assume the false negative cost is still the transaction amount, but now we assume that the false positive cost is the transaction amount divided by 50. 
+
+```{r}
+
+#not fraud, we say it was (assumed to less expensive than FN, this is a ceiling)
+combine_preds[,fp_loss := Amount / 50] # we divide by stuff here
+
+#initialize a dt to save results of the loop
+model_comparison <- data.table()
+
+#for probability threshold from 0.01 to 0.99
+for (prob in threshold){
+  
+  #for each model in question
+  for(model in c('rf_cv_pred_prob','xgb_pred_prob','lasso','elastic_net','logistic','avg_prob','max_prob','min_prob')){
+    
+    #calculate cost for this threshold for this model
+    cost <- calculate_cost(combine_preds,prob,model)
+    
+    #add it to our dt
+    model_comparison <- rbind.data.frame(model_comparison,data.table(prob,model,cost))
+    
+  }
+  
+}
+
+#create our chart
+ggplot(model_comparison,aes(x=prob,y=cost,color=model))+
+  geom_line() +
+  labs(title='Total Cost by Probability Threshold',subtitle='Scenario 3: FP = Amount / 50, FN = Amount', color = 'Model',y='Total Cost (FP + FN)',x='Probability Threshold (min cost at 0.04)')
+
+```
+
+```{r}
+model_comparison[cost>=min(model_comparison$cost)&cost<min(model_comparison$cost)+1000][order(cost)]
+```
+
+Here we see that the model that performs the best is the logistic model, which has the same cost as the minimum probability ensemble due to being trained on the unbalanced dataset and therefore having much lower predicted probabilities in every case (as in the prior two charts also).
+
+However, the ultimate decision depends on what we believe the costs of the false positive are, as well as how significant the differences between the logistic model and random forest are on our bottom line. We can see from our analysis that in all three scenarios, the random forest on the balanced dataset and the logistic model on the unbalanced dataset perform quite well. Although we are a financial institution in this scenario and likely to face regulation, in my own experience working on insurance a fraud detection model is unlikely to come under scrutiny in the way that a loan application model would, for instance. Therefore, the exlainability of the logistic model is not necessarily an advantage over the random forest, unless there is a perceived advantage in being able to explain the workings of the fraud model to internal stakeholders as well. 
+
+Another way to consider the model differences is the following:
+
+```{r}
+
+(5727.637 - 4949.290) /sum(response$Amount) * (1000000000000)
+
+```
+
+The above number represents the percentage difference in scenario 2 between choosing the random forest at 0.89 threshold (cost = \$4949.29) and using the logistic model at 0.04 threshold (cost = \$5727.64) assuming a trillion dollar payments company. That difference between the two represents > \$100,000,000. So while we might be tempted to say that logistic regression is almost as good and we should just use the much simpler model, in reality the practical implications of doing so should be taken into consideration. 
+
+
